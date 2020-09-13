@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     branches: [ master ]
+  pull_request:
+    branches: [ master ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,6 +38,7 @@ jobs:
           name: "crank-${{ matrix.os }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ls
 
   dex:
     runs-on: ${{ matrix.os }}
@@ -63,3 +66,4 @@ jobs:
           name: "serumdex-${{ matrix.os }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ls
