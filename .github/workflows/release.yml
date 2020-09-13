@@ -19,6 +19,20 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
+      - name: Build
+        run: |
+          cd crank
+          cargo build --release --locked
+
+  dex:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v2
+
       - name: Install deps
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
@@ -26,8 +40,4 @@ jobs:
           fi
 
       - name: Build
-        run: |
-          cd crank
-          cargo build --release --locked
-
-      
+        run: ./do.sh build dex
