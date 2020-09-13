@@ -57,9 +57,9 @@ jobs:
         run: ./do.sh build dex
 
       - name: Release
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: dex/target/bpfel-unknown-unknown/release/serum_dex.so
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dex/target/bpfel-unknown-unknown/release/serum_dex.so
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
