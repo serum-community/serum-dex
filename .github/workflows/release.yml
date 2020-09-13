@@ -29,6 +29,9 @@ jobs:
         run: |
           cd crank
           cargo build --release --locked
+      
+      - name: Check
+        run: ls
 
       - name: Release
         uses: softprops/action-gh-release@v0.1.5
@@ -38,7 +41,6 @@ jobs:
           name: "crank-${{ matrix.os }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ls
 
   dex:
     runs-on: ${{ matrix.os }}
@@ -57,6 +59,9 @@ jobs:
 
       - name: Build
         run: ./do.sh build dex
+      
+      - name: Check
+        run: ls
 
       - name: Release
         uses: softprops/action-gh-release@v0.1.5
@@ -66,4 +71,3 @@ jobs:
           name: "serumdex-${{ matrix.os }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ls
