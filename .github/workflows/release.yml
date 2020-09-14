@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    branches: [ master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crank:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: crank
+            asset_name: crank-linux
+          - os: macos-latest
+            artifact_name: crank
+            asset_name: crank-darwin
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install libudev-dev
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo apt-get install libudev-dev
+          fi
+
+      - name: Build
+        run: |
+          cd crank
+          cargo build --release --locked
+
+      - name: Upload
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: crank/target/release/crank
+          asset_name: ${{ matrix.asset_name }}
+          release_name: crank
+          tag: ${{ github.ref }}
+
+  dex:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: serum-dex
+            asset_name: serum_dex-linux.so
+          - os: macos-latest
+            artifact_name: serum-dex
+            asset_name: serum_dex-darwin.so
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install libudev-dev
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo apt-get install libudev-dev
+          fi
+
+      - name: Build
+        run: ./do.sh build dex
+      
+      - name: Upload
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dex/target/bpfel-unknown-unknown/release/serum_dex.so
+          asset_name: ${{ matrix.asset_name }}
+          release_name: serum-dex
+          tag: ${{ github.ref }}
