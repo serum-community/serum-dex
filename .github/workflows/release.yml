@@ -48,12 +48,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        - os: ubuntu-latest
-          artifact_name: serum-dex
-          asset_name: serumdex-linux-amd64
-        - os: macos-latest
-          artifact_name: serum-dex
-          asset_name: serumdex-macos-amd64
+        include:
+          - os: ubuntu-latest
+            artifact_name: serum-dex
+            asset_name: serumdex-linux-amd64
+          - os: macos-latest
+            artifact_name: serum-dex
+            asset_name: serumdex-macos-amd64
 
     steps:
       - uses: actions/checkout@v2
