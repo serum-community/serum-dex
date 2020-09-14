@@ -14,7 +14,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: crank
+            asset_name: crank-linux-amd64
+          - os: macos-latest
+            artifact_name: crank
+            asset_name: crank-macos-amd64
 
     steps:
       - uses: actions/checkout@v2
@@ -30,20 +36,24 @@ jobs:
           cd crank
           cargo build --release --locked
 
-      - name: Release
-        uses: softprops/action-gh-release@v0.1.5
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload
+        uses: svenstaro/upload-release-action@v2
         with:
-          files: crank/target/release/crank
-          name: "crank-${{ matrix.os }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: crank/target/release/crank
+          asset_name: ${{ matrix.asset_name }}
+          tag: ${{ github.ref }}
 
   dex:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        - os: ubuntu-latest
+          artifact_name: serum-dex
+          asset_name: serumdex-linux-amd64
+        - os: macos-latest
+          artifact_name: serum-dex
+          asset_name: serumdex-macos-amd64
 
     steps:
       - uses: actions/checkout@v2
@@ -57,11 +67,10 @@ jobs:
       - name: Build
         run: ./do.sh build dex
       
-      - name: Release
-        uses: softprops/action-gh-release@v0.1.5
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload
+        uses: svenstaro/upload-release-action@v2
         with:
-          files: dex/target/bpfel-unknown-unknown/release/serum_dex.so
-          name: "serumdex-${{ matrix.os }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dex/target/bpfel-unknown-unknown/release/serum_dex.so
+          asset_name: ${{ matrix.asset_name }}
+          tag: ${{ github.ref }}
