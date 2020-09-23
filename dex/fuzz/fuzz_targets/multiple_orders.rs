@@ -13,7 +13,7 @@ use libfuzzer_sys::fuzz_target;
 use solana_sdk::account_info::AccountInfo;
 
 use serum_dex::error::{DexError, DexErrorCode};
-use serum_dex::instruction::{CancelOrderInstruction, MarketInstruction, NewOrderInstruction};
+use serum_dex::instruction::{CancelOrderInstruction, MarketInstruction, NewOrderInstructionV2};
 use serum_dex::matching::Side;
 use serum_dex::state::{strip_header, MarketState, OpenOrders, ToAlignedBytes};
 use serum_dex_fuzz::{
@@ -26,7 +26,7 @@ use serum_dex_fuzz::{
 enum Action {
     PlaceOrder {
         owner_id: OwnerId,
-        instruction: NewOrderInstruction,
+        instruction: NewOrderInstructionV2,
     },
     CancelOrder {
         owner_id: OwnerId,
@@ -35,7 +35,26 @@ enum Action {
     },
     MatchOrders(u16),
     ConsumeEvents(u16),
-    SettleFunds(OwnerId),
+    SettleFunds(OwnerId, Option<ReferrerId>),
+    SweepFees,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
+struct ReferrerId(u8);
+
+impl Arbitrary for ReferrerId {
+    fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+        let i: u8 = u.arbitrary()?;
+        Ok(ReferrerId(i % 8))
+    }
+
+    fn size_hint(_: usize) -> (usize, Option<usize>) {
+        (1, Some(1))
+    }
+}
+
+struct Referrer<'bump> {
+    pc_account: AccountInfo<'bump>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
@@ -97,6 +116,15 @@ impl<'bump> Owner<'bump> {
     }
 }
 
+impl<'bump> Referrer<'bump> {
+    fn new(market_accounts: &MarketAccounts<'bump>, bump: &'bump Bump) -> Self {
+        let signer_account = new_sol_account(10, &bump);
+        let pc_account =
+            new_token_account(market_accounts.pc_mint.key, signer_account.key, 0, &bump);
+        Self { pc_account }
+    }
+}
+
 lazy_static! {
     static ref VERBOSE: u32 = std::env::var("FUZZ_VERBOSE")
         .map(|s| s.parse())
@@ -117,6 +145,7 @@ fn run_actions(actions: Vec<Action>) {
     let bump = Bump::new();
     let market_accounts = setup_market(&bump);
     let mut owners: HashMap<OwnerId, Owner> = HashMap::new();
+    let mut referrers: HashMap<ReferrerId, Referrer> = HashMap::new();
 
     let max_possible_coin_gained = get_max_possible_coin_gained(&actions);
     let max_possible_coin_spent = get_max_possible_coin_spent(&actions);
@@ -124,18 +153,20 @@ fn run_actions(actions: Vec<Action>) {
     let max_possible_pc_spent = get_max_possible_pc_spent(&actions);
 
     for action in actions {
-        run_action(action, &market_accounts, &mut owners, &bump);
+        run_action(action, &market_accounts, &mut owners, &mut referrers, &bump);
         if *VERBOSE >= 4 {
             run_action(
                 Action::MatchOrders(100),
                 &market_accounts,
                 &mut owners,
+                &mut referrers,
                 &bump,
             );
             run_action(
                 Action::ConsumeEvents(100),
                 &market_accounts,
                 &mut owners,
+                &mut referrers,
                 &bump,
             );
         }
@@ -159,16 +190,39 @@ fn run_actions(actions: Vec<Action>) {
             }
         }
     }
+
     actions.push(Action::MatchOrders(100));
     actions.push(Action::ConsumeEvents(100));
     for (owner_id, owner) in owners.iter().sorted_by_key(|(order_id, _)| *order_id) {
         if owner.open_orders().is_some() {
-            actions.push(Action::SettleFunds(*owner_id));
+            actions.push(Action::SettleFunds(*owner_id, None));
         }
     }
 
+    actions.push(Action::SweepFees);
     for action in actions {
-        run_action(action, &market_accounts, &mut owners, &bump);
+        run_action(action, &market_accounts, &mut owners, &mut referrers, &bump);
+    }
+
+    for owner in owners.values() {
+        let market_state =
+            MarketState::load(&market_accounts.market, market_accounts.market.owner).unwrap();
+        let load_orders_result = market_state.load_orders_mut(
+            &owner.orders_account,
+            Some(&owner.signer_account),
+            market_accounts.market.owner,
+            None,
+        );
+        let open_orders = match load_orders_result {
+            Err(e) if e == DexErrorCode::RentNotProvided.into() => {
+                continue;
+            }
+            _ => load_orders_result.unwrap(),
+        };
+        assert_eq!(open_orders.native_coin_free, 0);
+        assert_eq!(open_orders.native_coin_total, 0);
+        assert_eq!(open_orders.native_pc_free, 0);
+        assert_eq!(open_orders.native_pc_total, 0);
     }
 
     let market_state =
@@ -181,13 +235,33 @@ fn run_actions(actions: Vec<Action>) {
         .values()
         .map(|owner| get_token_account_balance(&owner.pc_account))
         .sum();
+    let total_referrer_rebates: u64 = referrers
+        .values()
+        .map(|referrer| get_token_account_balance(&referrer.pc_account))
+        .sum();
+    let swept_fees = get_token_account_balance(&market_accounts.fee_receiver);
     assert_eq!(
         total_coin_bal + market_state.coin_fees_accrued,
         owners.len() as u64 * INITIAL_COIN_BALANCE
     );
     assert_eq!(
-        total_pc_bal + market_state.pc_fees_accrued,
+        total_pc_bal + market_state.referrer_rebates_accrued + total_referrer_rebates + swept_fees,
         owners.len() as u64 * INITIAL_PC_BALANCE
+    );
+    assert_eq!(market_state.coin_fees_accrued, 0);
+    assert_eq!(market_state.pc_fees_accrued, 0);
+    assert_eq!(market_state.coin_deposits_total, 0);
+    assert_eq!(market_state.pc_deposits_total, 0);
+
+    assert_eq!(
+        market_state.coin_deposits_total,
+        get_token_account_balance(&market_accounts.coin_vault),
+    );
+    assert_eq!(
+        market_state.pc_deposits_total
+            + market_state.pc_fees_accrued
+            + market_state.referrer_rebates_accrued,
+        get_token_account_balance(&market_accounts.pc_vault)
     );
 
     for (owner_id, owner) in &owners {
@@ -252,6 +326,7 @@ fn run_action<'bump>(
     action: Action,
     market_accounts: &MarketAccounts<'bump>,
     owners: &mut HashMap<OwnerId, Owner<'bump>>,
+    referrers: &mut HashMap<ReferrerId, Referrer<'bump>>,
     bump: &'bump Bump,
 ) {
     if *VERBOSE >= 2 {
@@ -284,7 +359,7 @@ fn run_action<'bump>(
                     market_accounts.spl_token_program.clone(),
                     market_accounts.rent_sysvar.clone(),
                 ],
-                &MarketInstruction::NewOrder(instruction.clone()).pack(),
+                &MarketInstruction::NewOrderV2(instruction.clone()).pack(),
             )
             .map_err(|e| match e {
                 DexError::ErrorCode(DexErrorCode::InsufficientFunds) => {}
@@ -404,30 +479,56 @@ fn run_action<'bump>(
             .unwrap();
         }
 
-        Action::SettleFunds(owner_id) => {
+        Action::SettleFunds(owner_id, referrer_id) => {
             let owner = match owners.get(&owner_id) {
                 Some(owner) => owner,
                 None => {
                     return;
                 }
             };
+
             if !owner.open_orders().is_some() {
                 return;
             }
+
+            let mut accounts = vec![
+                market_accounts.market.clone(),
+                owner.orders_account.clone(),
+                owner.signer_account.clone(),
+                market_accounts.coin_vault.clone(),
+                market_accounts.pc_vault.clone(),
+                owner.coin_account.clone(),
+                owner.pc_account.clone(),
+                market_accounts.vault_signer.clone(),
+                market_accounts.spl_token_program.clone(),
+            ];
+            if let Some(referrer_id) = referrer_id {
+                let referrer = referrers
+                    .entry(referrer_id)
+                    .or_insert_with(|| Referrer::new(&market_accounts, &bump));
+
+                accounts.push(referrer.pc_account.clone());
+            }
+            process_instruction(
+                market_accounts.market.owner,
+                &accounts,
+                &MarketInstruction::SettleFunds.pack(),
+            )
+            .unwrap();
+        }
+
+        Action::SweepFees => {
             process_instruction(
                 market_accounts.market.owner,
                 &[
                     market_accounts.market.clone(),
-                    owner.orders_account.clone(),
-                    owner.signer_account.clone(),
-                    market_accounts.coin_vault.clone(),
                     market_accounts.pc_vault.clone(),
-                    owner.coin_account.clone(),
-                    owner.pc_account.clone(),
+                    market_accounts.sweep_authority.clone(),
+                    market_accounts.fee_receiver.clone(),
                     market_accounts.vault_signer.clone(),
                     market_accounts.spl_token_program.clone(),
                 ],
-                &MarketInstruction::SettleFunds.pack(),
+                &MarketInstruction::SweepFees.pack(),
             )
             .unwrap();
         }

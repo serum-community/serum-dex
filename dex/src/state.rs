@@ -33,10 +33,11 @@ use spl_token::pack::Pack;
 use crate::{
     critbit::Slab,
     error::{DexErrorCode, DexResult, SourceFileId},
-    fees::FeeTier,
+    fees::{self, FeeTier},
     instruction::{
+        SelfTradeBehavior,
         disable_authority, fee_sweeper, msrm_token, srm_token, CancelOrderInstruction,
-        InitializeMarketInstruction, MarketInstruction, NewOrderInstruction,
+        InitializeMarketInstruction, MarketInstruction, NewOrderInstructionV2,
     },
     matching::{OrderBookState, OrderType, Side},
 };
@@ -48,6 +49,7 @@ pub trait ToAlignedBytes {
 }
 
 impl ToAlignedBytes for Pubkey {
+    #[inline]
     fn to_aligned_bytes(&self) -> [u64; 4] {
         cast(self.to_bytes())
     }
@@ -117,6 +119,8 @@ pub struct MarketState {
 
     // 45
     pub fee_rate_bps: u64,
+    // 46
+    pub referrer_rebates_accrued: u64,
 }
 #[cfg(target_endian = "little")]
 unsafe impl Zeroable for MarketState {}
@@ -191,6 +195,7 @@ pub fn strip_header<'a, H: Pod, D: Pod>(
 }
 
 impl MarketState {
+    #[inline]
     pub fn load<'a>(
         market_account: &'a AccountInfo,
         program_id: &Pubkey,
@@ -211,6 +216,7 @@ impl MarketState {
         Ok(state)
     }
 
+    #[inline]
     pub fn check_flags(&self) -> DexResult {
         let flags = BitFlags::from_bits(self.account_flags)
             .map_err(|_| DexErrorCode::InvalidMarketFlags)?;
@@ -299,6 +305,7 @@ impl MarketState {
         Ok(Queue { header, buf })
     }
 
+    #[inline]
     fn check_coin_vault(&self, vault: account_parser::TokenAccount) -> DexResult {
         if self.coin_vault != vault.inner().key.to_aligned_bytes() {
             Err(DexErrorCode::WrongCoinVault)?
@@ -306,6 +313,7 @@ impl MarketState {
         Ok(())
     }
 
+    #[inline]
     fn check_pc_vault(&self, vault: account_parser::TokenAccount) -> DexResult {
         if self.pc_vault != vault.inner().key.to_aligned_bytes() {
             Err(DexErrorCode::WrongPcVault)?
@@ -313,6 +321,7 @@ impl MarketState {
         Ok(())
     }
 
+    #[inline]
     fn check_coin_payer(&self, payer: account_parser::TokenAccount) -> DexResult {
         if &payer.inner().try_borrow_data()?[..32] != transmute_to_bytes(&self.coin_mint) {
             Err(DexErrorCode::WrongCoinMint)?
@@ -320,6 +329,7 @@ impl MarketState {
         Ok(())
     }
 
+    #[inline]
     fn check_pc_payer(&self, payer: account_parser::TokenAccount) -> DexResult {
         if &payer.inner().try_borrow_data()?[..32] != transmute_to_bytes(&self.pc_mint) {
             Err(DexErrorCode::WrongPcMint)?
@@ -327,6 +337,7 @@ impl MarketState {
         Ok(())
     }
 
+    #[inline]
     fn load_fee_tier(
         &self,
         expected_owner: &[u64; 4],
@@ -363,7 +374,7 @@ impl MarketState {
     }
 
     fn pubkey(&self) -> Pubkey {
-        Pubkey::new(transmute_to_bytes(&self.own_address as &[_]))
+        Pubkey::new(cast_slice(&self.own_address as &[_]))
     }
 }
 
@@ -386,6 +397,7 @@ pub struct OpenOrders {
     pub orders: [u128; 128],
     // Using Option<NonZeroU64> in a pod type requires nightly
     pub client_order_ids: [u64; 128],
+    pub referrer_rebates_accrued: u64,
 }
 unsafe impl Pod for OpenOrders {}
 unsafe impl Zeroable for OpenOrders {}
@@ -659,7 +671,9 @@ enum RequestFlag {
     Bid = 0x04,
     PostOnly = 0x08,
     ImmediateOrCancel = 0x10,
+    DecrementTakeOnSelfTrade = 0x20,
 }
+
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
@@ -667,7 +681,8 @@ pub struct Request {
     request_flags: u8,
     owner_slot: u8,
     fee_tier: u8,
-    padding: [u8; 5],
+    self_trade_behavior: u8,
+    padding: [u8; 4],
     max_coin_qty_or_cancel_id: u64,
     native_pc_qty_locked: u64,
     order_id: u128,
@@ -689,6 +704,7 @@ pub enum RequestView<'a> {
         native_pc_qty_locked: Option<NonZeroU64>,
         owner: &'a [u64; 4],
         client_order_id: Option<NonZeroU64>,
+        self_trade_behavior: SelfTradeBehavior,
     },
     CancelOrder {
         side: Side,
@@ -701,7 +717,7 @@ pub enum RequestView<'a> {
 }
 
 impl Request {
-    #[inline]
+    #[inline(always)]
     pub fn new(view: RequestView) -> Self {
         match view {
             RequestView::NewOrder {
@@ -714,6 +730,7 @@ impl Request {
                 max_coin_qty,
                 native_pc_qty_locked,
                 client_order_id,
+                self_trade_behavior,
             } => {
                 let mut flags = BitFlags::from_flag(RequestFlag::NewOrder);
                 if side == Side::Bid {
@@ -729,6 +746,7 @@ impl Request {
                     request_flags: flags.bits(),
                     owner_slot,
                     fee_tier: fee_tier.into(),
+                    self_trade_behavior: self_trade_behavior.into(),
                     padding: Zeroable::zeroed(),
                     order_id: *order_id,
                     owner: *owner,
@@ -755,6 +773,7 @@ impl Request {
                     order_id: *order_id,
                     owner_slot: expected_owner_slot,
                     fee_tier: 0,
+                    self_trade_behavior: 0,
                     owner: *expected_owner,
                     native_pc_qty_locked: 0,
                     padding: Zeroable::zeroed(),
@@ -764,17 +783,8 @@ impl Request {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn as_view(&self) -> DexResult<RequestView> {
-        info!("(flags, slot, price, priority, 0)");
-        info!(
-            self.request_flags as u64,
-            self.owner_slot as u64,
-            (self.order_id >> 64) as u64,
-            self.order_id as u64,
-            0
-        );
-
         let flags = BitFlags::from_bits(self.request_flags).unwrap();
         let side = if flags.contains(RequestFlag::Bid) {
             Side::Bid
@@ -795,11 +805,14 @@ impl Request {
                 (false, false) => OrderType::Limit,
                 (true, true) => unreachable!(),
             };
+            let fee_tier = FeeTier::try_from_primitive(self.fee_tier).or(check_unreachable!())?;
+            let self_trade_behavior = SelfTradeBehavior::try_from_primitive(self.self_trade_behavior).or(check_unreachable!())?;
             Ok(RequestView::NewOrder {
                 side,
                 order_type,
                 owner_slot: self.owner_slot,
-                fee_tier: FeeTier::try_from_primitive(self.fee_tier).unwrap(),
+                fee_tier,
+                self_trade_behavior,
                 order_id: &self.order_id,
                 owner: &self.owner,
                 max_coin_qty: NonZeroU64::new(self.max_coin_qty_or_cancel_id).unwrap(),
@@ -874,6 +887,7 @@ enum EventFlag {
 }
 
 impl EventFlag {
+    #[inline]
     fn from_side(side: Side) -> BitFlags<Self> {
         match side {
             Side::Bid => EventFlag::Bid.into(),
@@ -881,6 +895,7 @@ impl EventFlag {
         }
     }
 
+    #[inline]
     fn flags_to_side(flags: BitFlags<Self>) -> Side {
         if flags.contains(EventFlag::Bid) {
             Side::Bid
@@ -915,7 +930,7 @@ unsafe impl TriviallyTransmutable for Event {}
 unsafe impl TriviallyTransmutable for Request {}
 
 impl Event {
-    #[inline]
+    #[inline(always)]
     pub fn new(view: EventView) -> Self {
         match view {
             EventView::Fill {
@@ -984,6 +999,7 @@ impl Event {
         }
     }
 
+    #[inline(always)]
     pub fn as_view(&self) -> DexResult<EventView> {
         let flags = BitFlags::from_bits(self.event_flags).unwrap();
         let side = EventFlag::flags_to_side(flags);
@@ -1125,11 +1141,42 @@ fn invoke_spl_token(
                 .clone()
         })
         .collect();
+    info!("invoking...");
     spl_token::processor::Processor::process(
         &instruction.program_id,
         &account_infos,
         &instruction.data,
-    )
+    )?;
+    info!("invoked");
+    Ok(())
+}
+
+#[cfg(not(feature = "client"))]
+fn send_from_vault<'a, 'b: 'a>(
+    native_amount: u64,
+    recipient: account_parser::TokenAccount<'a, 'b>,
+    vault: account_parser::TokenAccount<'a, 'b>,
+    spl_token_program: account_parser::SplTokenProgram<'a, 'b>,
+    vault_signer: account_parser::VaultSigner<'a, 'b>,
+    vault_signer_seeds: &[&[u8]],
+) -> DexResult {
+    let deposit_instruction = spl_token::instruction::transfer(
+        &spl_token::ID,
+        vault.inner().key,
+        recipient.inner().key,
+        &vault_signer.inner().key,
+        &[],
+        native_amount,
+    )?;
+    let accounts: &[AccountInfo] = &[
+        vault.inner().clone(),
+        recipient.inner().clone(),
+        vault_signer.inner().clone(),
+        spl_token_program.inner().clone(),
+    ];
+    invoke_spl_token(&deposit_instruction, &accounts[..], &[vault_signer_seeds])
+        .map_err(|_| DexErrorCode::TransferFailed)?;
+    Ok(())
 }
 
 pub mod account_parser {
@@ -1393,7 +1440,7 @@ pub mod account_parser {
     }
 
     pub struct NewOrderArgs<'a, 'b: 'a> {
-        pub instruction: &'a NewOrderInstruction,
+        pub instruction: &'a NewOrderInstructionV2,
         pub market: &'a mut MarketState,
         pub open_orders: &'a mut OpenOrders,
         pub open_orders_address: &'a [u64; 4],
@@ -1408,7 +1455,7 @@ pub mod account_parser {
     impl<'a, 'b: 'a> NewOrderArgs<'a, 'b> {
         pub fn with_parsed_args<T>(
             program_id: &'a Pubkey,
-            instruction: &'a NewOrderInstruction,
+            instruction: &'a NewOrderInstructionV2,
             accounts: &'a [AccountInfo<'b>],
             f: impl FnOnce(NewOrderArgs) -> DexResult<T>,
         ) -> DexResult<T> {
@@ -1649,6 +1696,7 @@ pub mod account_parser {
         pub pc_wallet: PcWallet<'a, 'b>,
         pub vault_signer: VaultSigner<'a, 'b>,
         pub spl_token_program: SplTokenProgram<'a, 'b>,
+        pub referrer: Option<PcWallet<'a, 'b>>,
     }
     impl<'a, 'b: 'a> SettleFundsArgs<'a, 'b> {
         pub fn with_parsed_args<T>(
@@ -1656,8 +1704,9 @@ pub mod account_parser {
             accounts: &'a [AccountInfo<'b>],
             f: impl FnOnce(SettleFundsArgs) -> DexResult<T>,
         ) -> DexResult<T> {
-            check_assert_eq!(accounts.len(), 9)?;
-            let &[
+            check_assert!(accounts.len() == 9 || accounts.len() == 10)?;
+            #[rustfmt::skip]
+            let (&[
                 ref market_acc,
                 ref open_orders_acc,
                 ref owner_acc,
@@ -1667,7 +1716,7 @@ pub mod account_parser {
                 ref pc_wallet_acc,
                 ref vault_signer_acc,
                 ref spl_token_program_acc,
-            ]: &'a [AccountInfo<'b>; 9] = array_ref![accounts, 0, 9];
+            ], remaining_accounts) = array_refs![accounts, 9; ..;];
             let spl_token_program = SplTokenProgram::new(spl_token_program_acc)?;
             let mut market = MarketState::load(market_acc, program_id)?;
             let owner = SignerAccount::new(owner_acc).or(check_unreachable!())?;
@@ -1679,6 +1728,14 @@ pub mod account_parser {
                 CoinWallet::from_account(coin_wallet_acc, &market).or(check_unreachable!())?;
             let pc_wallet =
                 PcWallet::from_account(pc_wallet_acc, &market).or(check_unreachable!())?;
+
+            let referrer = match remaining_accounts {
+                &[] => None,
+                &[ref referrer_acc] => {
+                    Some(PcWallet::from_account(referrer_acc, &market).or(check_unreachable!())?)
+                }
+                _ => check_unreachable!()?,
+            };
 
             let vault_signer = VaultSigner::new(vault_signer_acc, &market, program_id)?;
 
@@ -1694,6 +1751,7 @@ pub mod account_parser {
                 pc_wallet,
                 vault_signer,
                 spl_token_program,
+                referrer,
             };
             f(args)
         }
@@ -1790,7 +1848,16 @@ impl State {
             MarketInstruction::InitializeMarket(ref inner) => Self::process_initialize_market(
                 account_parser::InitializeMarketArgs::new(program_id, inner, accounts)?,
             )?,
-            MarketInstruction::NewOrder(ref inner) => {
+            MarketInstruction::NewOrder(inner) => {
+                let new_order_v2 = inner.add_self_trade_behavior(SelfTradeBehavior::DecrementTake);
+                account_parser::NewOrderArgs::with_parsed_args(
+                    program_id,
+                    &new_order_v2,
+                    accounts,
+                    Self::process_new_order,
+                )?
+            }
+            MarketInstruction::NewOrderV2(ref inner) => {
                 account_parser::NewOrderArgs::with_parsed_args(
                     program_id,
                     inner,
@@ -1862,10 +1929,14 @@ impl State {
             pc_wallet,
             vault_signer,
             spl_token_program,
+            referrer,
         } = args;
 
         let native_coin_amount = open_orders.native_coin_free;
         let native_pc_amount = open_orders.native_pc_free;
+
+        market.coin_deposits_total -= native_coin_amount;
+        market.pc_deposits_total -= native_pc_amount;
 
         open_orders.native_coin_free = 0;
         open_orders.native_pc_free = 0;
@@ -1899,31 +1970,35 @@ impl State {
         let market_pubkey = market.pubkey();
         let vault_signer_seeds = gen_vault_signer_seeds(&market.vault_signer_nonce, &market_pubkey);
 
-        for (token_amount, wallet_account, vault) in token_infos.iter() {
-            let deposit_instruction = spl_token::instruction::transfer(
-                &spl_token::ID,
-                vault.inner().key,
-                wallet_account.inner().key,
-                &vault_signer.inner().key,
-                &[],
-                *token_amount,
+        for &(token_amount, wallet_account, vault) in token_infos.iter() {
+            send_from_vault(
+                token_amount,
+                wallet_account,
+                vault,
+                spl_token_program,
+                vault_signer,
+                &vault_signer_seeds,
             )?;
-            let accounts: &[AccountInfo] = &[
-                vault.inner().clone(),
-                wallet_account.inner().clone(),
-                vault_signer.inner().clone(),
-                spl_token_program.inner().clone(),
-            ];
-            info!("invoking...");
-            invoke_spl_token(
-                &deposit_instruction,
-                &accounts[..],
-                &[&vault_signer_seeds[..]],
-            )
-            .map_err(|_| DexErrorCode::TransferFailed)?;
-            info!("invoked");
         }
-        info!("finished transfers");
+
+        match referrer {
+            Some(referrer_pc_wallet) if open_orders.referrer_rebates_accrued > 0 => {
+                send_from_vault(
+                    open_orders.referrer_rebates_accrued,
+                    referrer_pc_wallet.token_account(),
+                    pc_vault.token_account(),
+                    spl_token_program,
+                    vault_signer,
+                    &vault_signer_seeds,
+                )?;
+            }
+            _ => {
+                market.pc_fees_accrued += open_orders.referrer_rebates_accrued;
+            }
+        };
+        market.referrer_rebates_accrued -= open_orders.referrer_rebates_accrued;
+        open_orders.referrer_rebates_accrued = 0;
+
         Ok(())
     }
 
@@ -2000,7 +2075,6 @@ impl State {
                 None => break,
                 Some(e) => e,
             };
-            info!("Processing an event");
 
             let view = event.as_view()?;
             let owner: [u64; 4] = event.owner;
@@ -2038,6 +2112,7 @@ impl State {
                             open_orders.native_pc_total -= native_qty_paid;
                             open_orders.native_coin_total += native_qty_received;
                             open_orders.native_coin_free += native_qty_received;
+
                             if maker {
                                 open_orders.native_pc_free += native_fee_or_rebate;
                             }
@@ -2048,6 +2123,10 @@ impl State {
                             open_orders.native_pc_free += native_qty_received;
                         }
                     };
+                    if !maker {
+                        let referrer_rebate = fees::referrer_rebate(native_fee_or_rebate);
+                        open_orders.referrer_rebates_accrued += referrer_rebate;
+                    }
                     if let Some(client_id) = client_order_id {
                         debug_assert_eq!(
                             client_id.get(),
@@ -2214,6 +2293,7 @@ impl State {
             order_type: instruction.order_type,
             order_id: &order_id,
             fee_tier,
+            self_trade_behavior: instruction.self_trade_behavior,
             owner: open_orders_address,
             owner_slot,
             max_coin_qty: instruction.max_qty,
@@ -2248,35 +2328,19 @@ impl State {
         } = args;
         let token_amount = market.pc_fees_accrued;
         market.pc_fees_accrued = 0;
-        let deposit_instruction = spl_token::instruction::transfer(
-            &spl_token::ID,
-            pc_vault.account().key,
-            fee_receiver.account().key,
-            &vault_signer.inner().key,
-            &[],
-            token_amount,
-        )?;
 
         let market_pubkey = market.pubkey();
         let vault_signer_seeds = gen_vault_signer_seeds(&market.vault_signer_nonce, &market_pubkey);
-        let accounts: &[AccountInfo] = &[
-            pc_vault.account().clone(),
-            fee_receiver.account().clone(),
-            vault_signer.inner().clone(),
-            spl_token_program.inner().clone(),
-        ];
-        info!("invoking...");
-        invoke_spl_token(
-            &deposit_instruction,
-            &accounts[..],
-            &[&vault_signer_seeds[..]],
+        send_from_vault(
+            token_amount,
+            fee_receiver.token_account(),
+            pc_vault.token_account(),
+            spl_token_program,
+            vault_signer,
+            &vault_signer_seeds,
         )
-        .map_err(|_| DexErrorCode::TransferFailed)?;
-        info!("invoked");
-        Ok(())
     }
 
-    #[inline(never)]
     fn process_initialize_market(args: account_parser::InitializeMarketArgs) -> DexResult {
         let &InitializeMarketInstruction {
             coin_lot_size,
@@ -2321,8 +2385,6 @@ impl State {
         let (eq_hdr_array, eq_buf_words) = mut_array_refs![eq_view, EQ_HEADER_WORDS; .. ;];
         let eq_buf: &[Event] = remove_slop(cast_slice(eq_buf_words));
         if eq_buf.len() < 128 {
-            let errno = DexErrorCode::EventQueueTooSmall;
-            info!(errno as u64, eq_buf.len(), 0, 0, 0);
             Err(DexErrorCode::EventQueueTooSmall)?
         }
         let eq_hdr: &mut EventQueueHeader = try_cast_mut(eq_hdr_array).or(check_unreachable!())?;
@@ -2377,6 +2439,7 @@ impl State {
 
             pc_dust_threshold,
             fee_rate_bps: fee_rate_bps as u64,
+            referrer_rebates_accrued: 0,
         };
         Ok(())
     }

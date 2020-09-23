@@ -66,6 +66,7 @@ const fn rebate_bps(bps: u64) -> U64F64 {
 }
 
 impl FeeTier {
+    #[inline]
     pub fn from_srm_and_msrm_balances(srm_held: u64, msrm_held: u64) -> FeeTier {
         let one_srm = 1_000_000;
         match () {
@@ -79,6 +80,7 @@ impl FeeTier {
         }
     }
 
+    #[inline]
     pub fn maker_rebate(self, pc_qty: u64) -> u64 {
         use FeeTier::*;
         let rate: U64F64 = match self {
@@ -88,7 +90,6 @@ impl FeeTier {
         rate.mul_u64(pc_qty).floor()
     }
 
-    #[inline(always)]
     fn taker_rate(self) -> U64F64 {
         use FeeTier::*;
         match self {
@@ -102,12 +103,14 @@ impl FeeTier {
         }
     }
 
+    #[inline]
     pub fn taker_fee(self, pc_qty: u64) -> u64 {
         let rate = self.taker_rate();
         let exact_fee: U64F64 = rate.mul_u64(pc_qty);
         exact_fee.floor() + ((exact_fee.frac_part() != 0) as u64)
     }
 
+    #[inline]
     pub fn remove_taker_fee(self, pc_qty_incl_fee: u64) -> u64 {
         let rate = self.taker_rate();
         U64F64::from_int(pc_qty_incl_fee)
@@ -115,6 +118,11 @@ impl FeeTier {
             .try_into()
             .unwrap()
     }
+}
+
+#[inline]
+pub fn referrer_rebate(amount: u64) -> u64 {
+    amount / 5
 }
 
 #[cfg(test)]
@@ -126,12 +134,12 @@ mod tests {
         #[test]
         fn positive_net_fees(tt: FeeTier, mt: FeeTier, qty in 1..=std::u64::MAX) {
             let fee = tt.taker_fee(qty);
-            let rebate = mt.maker_rebate(qty);
+            let rebate = mt.maker_rebate(qty) + referrer_rebate(fee);
             assert!(fee > rebate);
             let net_bps_u64f64 = (fee - rebate) as u128 * 10_000;
-            let four_bps = (qty as u128) * 4;
+            let three_bps = (qty as u128) * 3;
             let dust_qty_u64f64 = 1 << 32;
-            assert!(net_bps_u64f64 + dust_qty_u64f64 > four_bps, "{:x}, {:x}, {:x}", qty, net_bps_u64f64, four_bps);
+            assert!(net_bps_u64f64 + dust_qty_u64f64 > three_bps, "{:x}, {:x}, {:x}", qty, net_bps_u64f64, three_bps);
         }
 
         #[test]
