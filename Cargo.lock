@@ -2878,10 +2878,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD:crank/Cargo.lock
-name = "serum_dex"
-version = "0.2.0"
-=======
 name = "serde_urlencoded"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2940,7 +2936,6 @@ dependencies = [
 [[package]]
 name = "serum-common"
 version = "0.1.0"
->>>>>>> upstream/master:Cargo.lock
 dependencies = [
  "anyhow",
  "arrayref",
