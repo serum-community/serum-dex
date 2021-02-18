@@ -33,7 +33,7 @@ jobs:
 
       - name: Build
         run: |
-          cd crank
+          cd dex/crank
           cargo build --release --locked
 
       - name: Upload
