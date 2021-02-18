@@ -1,17 +1,17 @@
 #![cfg_attr(not(feature = "program"), allow(unused))]
-use std::convert::TryInto;
 use crate::error::DexError;
 use crate::matching::{OrderType, Side};
 use bytemuck::cast;
 use serde::{Deserialize, Serialize};
-use solana_sdk::{
+use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
 };
+use std::convert::TryInto;
 
 use arrayref::{array_ref, array_refs};
-use std::num::NonZeroU64;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use std::num::NonZeroU64;
 
 #[cfg(test)]
 use proptest::prelude::*;
@@ -19,22 +19,22 @@ use proptest::prelude::*;
 use proptest_derive::Arbitrary;
 
 pub mod srm_token {
-    use solana_sdk::declare_id;
+    use solana_program::declare_id;
     declare_id!("SRMuApVNdxXokk5GT7XD5cUUgXMBCoAz2LHeuAoKWRt");
 }
 
 pub mod msrm_token {
-    use solana_sdk::declare_id;
+    use solana_program::declare_id;
     declare_id!("MSRMcoVyrFxnSgo5uXwone5SKcGhT1KEJMFEkMEWf9L");
 }
 
 pub mod disable_authority {
-    use solana_sdk::declare_id;
+    use solana_program::declare_id;
     declare_id!("5ZVJgwWxMsqXxRMYHXqMwH2hd4myX5Ef4Au2iUsuNQ7V");
 }
 
 pub mod fee_sweeper {
-    use solana_sdk::declare_id;
+    use solana_program::declare_id;
     declare_id!("DeqYsmBd9BnrbgUwQjVH4sQWK71dEgE6eoZFw3Rp4ftE");
 }
 
@@ -58,7 +58,9 @@ pub struct InitializeMarketInstruction {
     pub pc_dust_threshold: u64,
 }
 
-#[derive(PartialEq, Eq, Copy, Clone, Debug, TryFromPrimitive, IntoPrimitive, Serialize, Deserialize)]
+#[derive(
+    PartialEq, Eq, Copy, Clone, Debug, TryFromPrimitive, IntoPrimitive, Serialize, Deserialize,
+)]
 #[cfg_attr(test, derive(Arbitrary))]
 #[cfg_attr(feature = "fuzz", derive(arbitrary::Arbitrary))]
 #[repr(u8)]
@@ -105,7 +107,10 @@ pub struct NewOrderInstructionV1 {
 }
 
 impl NewOrderInstructionV1 {
-    pub fn add_self_trade_behavior(self, self_trade_behavior: SelfTradeBehavior) -> NewOrderInstructionV2 {
+    pub fn add_self_trade_behavior(
+        self,
+        self_trade_behavior: SelfTradeBehavior,
+    ) -> NewOrderInstructionV2 {
         let NewOrderInstructionV1 {
             side,
             limit_price,
@@ -313,8 +318,9 @@ impl MarketInstruction {
                 let (v1_data_arr, v2_data_arr) = array_refs![data_arr, 32, 4];
                 let v1_instr = NewOrderInstructionV1::unpack(v1_data_arr)?;
                 let self_trade_behavior = SelfTradeBehavior::try_from_primitive(
-                    u32::from_le_bytes(*v2_data_arr).try_into().ok()?
-                ).ok()?;
+                    u32::from_le_bytes(*v2_data_arr).try_into().ok()?,
+                )
+                .ok()?;
                 v1_instr.add_self_trade_behavior(self_trade_behavior)
             }),
             _ => return None,
@@ -348,7 +354,7 @@ pub fn initialize_market(
     pc_lot_size: u64,
     vault_signer_nonce: u64,
     pc_dust_threshold: u64,
-) -> Result<solana_sdk::instruction::Instruction, DexError> {
+) -> Result<solana_program::instruction::Instruction, DexError> {
     let data = MarketInstruction::InitializeMarket(InitializeMarketInstruction {
         coin_lot_size,
         pc_lot_size,
@@ -385,6 +391,240 @@ pub fn initialize_market(
         //srm_mint,
     ];
 
+    Ok(Instruction {
+        program_id: *program_id,
+        data,
+        accounts,
+    })
+}
+
+pub fn new_order(
+    market: &Pubkey,
+    open_orders_account: &Pubkey,
+    request_queue: &Pubkey,
+    payer: &Pubkey,
+    open_orders_account_owner: &Pubkey,
+    coin_vault: &Pubkey,
+    pc_vault: &Pubkey,
+    spl_token_program_id: &Pubkey,
+    rent_sysvar_id: &Pubkey,
+    srm_account_referral: Option<&Pubkey>,
+    program_id: &Pubkey,
+    side: Side,
+    limit_price: NonZeroU64,
+    max_qty: NonZeroU64,
+    order_type: OrderType,
+    client_id: u64,
+    self_trade_behavior: SelfTradeBehavior,
+) -> Result<Instruction, DexError> {
+    let data = MarketInstruction::NewOrderV2(NewOrderInstructionV2 {
+        side,
+        limit_price,
+        max_qty,
+        order_type,
+        client_id,
+        self_trade_behavior,
+    })
+    .pack();
+    let mut accounts = vec![
+        AccountMeta::new(*market, false),
+        AccountMeta::new(*open_orders_account, false),
+        AccountMeta::new(*request_queue, false),
+        AccountMeta::new(*payer, false),
+        AccountMeta::new_readonly(*open_orders_account_owner, true),
+        AccountMeta::new(*coin_vault, false),
+        AccountMeta::new(*pc_vault, false),
+        AccountMeta::new_readonly(*spl_token_program_id, false),
+        AccountMeta::new_readonly(*rent_sysvar_id, false),
+    ];
+    if let Some(key) = srm_account_referral {
+        accounts.push(AccountMeta::new(*key, false))
+    }
+    Ok(Instruction {
+        program_id: *program_id,
+        data,
+        accounts,
+    })
+}
+
+pub fn match_orders(
+    program_id: &Pubkey,
+    market: &Pubkey,
+    request_queue: &Pubkey,
+    bids: &Pubkey,
+    asks: &Pubkey,
+    event_queue: &Pubkey,
+    coin_fee_receivable_account: &Pubkey,
+    pc_fee_receivable_account: &Pubkey,
+    limit: u16,
+) -> Result<Instruction, DexError> {
+    let data = MarketInstruction::MatchOrders(limit).pack();
+    let accounts: Vec<AccountMeta> = vec![
+        AccountMeta::new(*market, false),
+        AccountMeta::new(*request_queue, false),
+        AccountMeta::new(*event_queue, false),
+        AccountMeta::new(*bids, false),
+        AccountMeta::new(*asks, false),
+        AccountMeta::new(*coin_fee_receivable_account, false),
+        AccountMeta::new(*pc_fee_receivable_account, false),
+    ];
+    Ok(Instruction {
+        program_id: *program_id,
+        data,
+        accounts,
+    })
+}
+
+pub fn consume_events(
+    program_id: &Pubkey,
+    open_orders_accounts: Vec<&Pubkey>,
+    market: &Pubkey,
+    event_queue: &Pubkey,
+    coin_fee_receivable_account: &Pubkey,
+    pc_fee_receivable_account: &Pubkey,
+    limit: u16,
+) -> Result<Instruction, DexError> {
+    let data = MarketInstruction::ConsumeEvents(limit).pack();
+    let mut accounts: Vec<AccountMeta> = open_orders_accounts
+        .iter()
+        .map(|key| AccountMeta::new(**key, false))
+        .collect();
+    accounts.append(&mut vec![
+        AccountMeta::new(*market, false),
+        AccountMeta::new(*event_queue, false),
+        AccountMeta::new(*coin_fee_receivable_account, false),
+        AccountMeta::new(*pc_fee_receivable_account, false),
+    ]);
+    Ok(Instruction {
+        program_id: *program_id,
+        data,
+        accounts,
+    })
+}
+
+pub fn cancel_order(
+    program_id: &Pubkey,
+    market: &Pubkey,
+    open_orders_account: &Pubkey,
+    open_orders_account_owner: &Pubkey,
+    request_queue: &Pubkey,
+    side: Side,
+    order_id: u128,
+    owner: [u64; 4],
+    owner_slot: u8,
+) -> Result<Instruction, DexError> {
+    let data = MarketInstruction::CancelOrder(CancelOrderInstruction {
+        side,
+        order_id,
+        owner,
+        owner_slot,
+    })
+    .pack();
+    let accounts: Vec<AccountMeta> = vec![
+        AccountMeta::new_readonly(*market, false),
+        AccountMeta::new(*open_orders_account, false),
+        AccountMeta::new(*request_queue, false),
+        AccountMeta::new_readonly(*open_orders_account_owner, true),
+    ];
+    Ok(Instruction {
+        program_id: *program_id,
+        data,
+        accounts,
+    })
+}
+
+pub fn settle_funds(
+    program_id: &Pubkey,
+    market: &Pubkey,
+    spl_token_program_id: &Pubkey,
+    open_orders_account: &Pubkey,
+    open_orders_account_owner: &Pubkey,
+    coin_vault: &Pubkey,
+    coin_wallet: &Pubkey,
+    pc_vault: &Pubkey,
+    pc_wallet: &Pubkey,
+    referrer_pc_wallet: Option<&Pubkey>,
+    vault_signer: &Pubkey,
+) -> Result<Instruction, DexError> {
+    let data = MarketInstruction::SettleFunds.pack();
+    let mut accounts: Vec<AccountMeta> = vec![
+        AccountMeta::new(*market, false),
+        AccountMeta::new(*open_orders_account, false),
+        AccountMeta::new_readonly(*open_orders_account_owner, true),
+        AccountMeta::new(*coin_vault, false),
+        AccountMeta::new(*pc_vault, false),
+        AccountMeta::new(*coin_wallet, false),
+        AccountMeta::new(*pc_wallet, false),
+        AccountMeta::new_readonly(*vault_signer, false),
+        AccountMeta::new_readonly(*spl_token_program_id, false),
+    ];
+    if let Some(key) = referrer_pc_wallet {
+        accounts.push(AccountMeta::new(*key, false))
+    }
+    Ok(Instruction {
+        program_id: *program_id,
+        data,
+        accounts,
+    })
+}
+
+pub fn cancel_order_by_client_id(
+    program_id: &Pubkey,
+    market: &Pubkey,
+    open_orders_account: &Pubkey,
+    open_orders_account_owner: &Pubkey,
+    request_queue: &Pubkey,
+    client_id: u64,
+) -> Result<Instruction, DexError> {
+    let data = MarketInstruction::CancelOrderByClientId(client_id).pack();
+    let accounts: Vec<AccountMeta> = vec![
+        AccountMeta::new_readonly(*market, false),
+        AccountMeta::new(*open_orders_account, false),
+        AccountMeta::new(*request_queue, false),
+        AccountMeta::new_readonly(*open_orders_account_owner, true),
+    ];
+    Ok(Instruction {
+        program_id: *program_id,
+        data,
+        accounts,
+    })
+}
+
+pub fn disable_market(
+    program_id: &Pubkey,
+    market: &Pubkey,
+    disable_authority_key: &Pubkey,
+) -> Result<Instruction, DexError> {
+    let data = MarketInstruction::DisableMarket.pack();
+    let accounts: Vec<AccountMeta> = vec![
+        AccountMeta::new(*market, false),
+        AccountMeta::new_readonly(*disable_authority_key, true),
+    ];
+    Ok(Instruction {
+        program_id: *program_id,
+        data,
+        accounts,
+    })
+}
+
+pub fn sweep_fees(
+    program_id: &Pubkey,
+    market: &Pubkey,
+    pc_vault: &Pubkey,
+    fee_sweeping_authority: &Pubkey,
+    fee_receivable_account: &Pubkey,
+    vault_signer: &Pubkey,
+    spl_token_program_id: &Pubkey,
+) -> Result<Instruction, DexError> {
+    let data = MarketInstruction::SweepFees.pack();
+    let accounts: Vec<AccountMeta> = vec![
+        AccountMeta::new(*market, false),
+        AccountMeta::new(*pc_vault, false),
+        AccountMeta::new_readonly(*fee_sweeping_authority, true),
+        AccountMeta::new(*fee_receivable_account, false),
+        AccountMeta::new_readonly(*vault_signer, false),
+        AccountMeta::new_readonly(*spl_token_program_id, false),
+    ];
     Ok(Instruction {
         program_id: *program_id,
         data,

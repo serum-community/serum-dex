@@ -1,6 +1,10 @@
-bin/
-dex/target
-crank/target
-.idea*
+bin/*
+.idea/
+target/
 *~
+<<<<<<< HEAD
 .DS_Store
+=======
+*.swp
+*.swo
+>>>>>>> upstream/master
